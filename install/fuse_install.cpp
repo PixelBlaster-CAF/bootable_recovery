@@ -41,14 +41,9 @@
 #include "install/install.h"
 #include "recovery_utils/roots.h"
 
-#define MMC_0_TYPE_PATH "/sys/block/mmcblk0/device/type"
-#define SDCARD_BLK_0_PATH "/dev/block/mmcblk0p1"
-#define MMC_1_TYPE_PATH "/sys/block/mmcblk1/device/type"
-#define SDCARD_BLK_1_PATH "/dev/block/mmcblk1p1"
-#define SDEXPRESS_0_TYPE_PATH "/sys/block/nvme0n1/device/transport"
-#define SDEXPRESS_BLK_0_PATH "/dev/block/nvme0n1p1"
+using android::volmgr::VolumeInfo;
+using android::volmgr::VolumeManager;
 
-static constexpr const char* SDCARD_ROOT = "/data/media/0";
 // How long (in seconds) we wait for the fuse-provided package file to
 // appear, before timing out.
 static constexpr int SDCARD_INSTALL_TIMEOUT = 10;
@@ -65,8 +60,6 @@ static void SetSdcardUpdateBootloaderMessage() {
 
 // Returns the selected filename, or an empty string.
 static std::string BrowseDirectory(const std::string& path, Device* device, RecoveryUI* ui) {
-  ensure_path_mounted(path);
-
   std::unique_ptr<DIR, decltype(&closedir)> d(opendir(path.c_str()), closedir);
   if (!d) {
     PLOG(ERROR) << "error opening " << path;
@@ -149,12 +142,6 @@ static bool StartInstallPackageFuse(std::string_view path) {
     return false;
   }
 
-  if (android::base::StartsWith(path, SDCARD_ROOT)) {
-    // The installation process expects to find the sdcard unmounted. Unmount it with MNT_DETACH so
-    // that our open file continues to work but new references see it as unmounted.
-    umount2("/data", MNT_DETACH);
-  }
-
   return run_fuse_sideload(std::move(fuse_data_provider)) == 0;
 }
 
@@ -217,94 +204,15 @@ InstallResult InstallWithFuseFromPath(std::string_view path, Device* device) {
   return result;
 }
 
-// Check whether the mmc type of provided path (/sys/block/mmcblk*/device/type)
-// is SD (sdcard) or not.
-static int check_mmc_is_sdcard (const char* mmc_type_path)
-{
-  std::string mmc_type;
-
-  LOG(INFO) << "Checking mmc type for path : " << mmc_type_path;
-
-  if (!android::base::ReadFileToString(mmc_type_path, &mmc_type)) {
-    LOG(ERROR) << "Failed to read mmc type : " << strerror(errno);
-    return -1;
-  }
-  LOG(INFO) << "MMC type is : " << mmc_type.c_str();
-  if (!strncmp(mmc_type.c_str(), "SD", strlen("SD")) || !strncmp(mmc_type.c_str(), "pcie", strlen("pcie")))
-    return 0;
-  else
-    return -1;
-}
-
-// Gather mount point and other info from fstab, find the right block
-// path where sdcard is mounted, and try mounting it.
-static int do_sdcard_mount() {
-  int rc = 0;
-
-  Volume *v = volume_for_mount_point("/sdcard");
-  if (v == nullptr) {
-    LOG(ERROR) << "Unknown volume for /sdcard. Check fstab\n";
-    goto error;
-  }
-  if (strncmp(v->fs_type.c_str(), "vfat", sizeof("vfat")) && strncmp(v->fs_type.c_str(), "exfat", sizeof("exfat"))) {
-    LOG(ERROR) << "Unsupported format on the sdcard: "
-               << v->fs_type.c_str() << "\n";
-    goto error;
-  }
-
-  if (check_mmc_is_sdcard(MMC_0_TYPE_PATH) == 0) {
-    LOG(INFO) << "Mounting sdcard on " << SDCARD_BLK_0_PATH;
-    rc = mount(SDCARD_BLK_0_PATH,
-               v->mount_point.c_str(),
-               v->fs_type.c_str(),
-               v->flags,
-               v->fs_options.c_str());
-  }
-  else if (check_mmc_is_sdcard(MMC_1_TYPE_PATH) == 0) {
-    LOG(INFO) << "Mounting sdcard on " << SDCARD_BLK_1_PATH;
-    rc = mount(SDCARD_BLK_1_PATH,
-               v->mount_point.c_str(),
-               v->fs_type.c_str(),
-               v->flags,
-               v->fs_options.c_str());
-  }
-  else if (check_mmc_is_sdcard(SDEXPRESS_0_TYPE_PATH) == 0) {
-    LOG(INFO) << "Mounting sdexpress on " << SDEXPRESS_BLK_0_PATH;
-    rc = mount(SDEXPRESS_BLK_0_PATH,
-               v->mount_point.c_str(),
-               v->fs_type.c_str(),
-               v->flags,
-               v->fs_options.c_str());
-  }
-  else {
-    LOG(ERROR) << "Unable to get the block path for sdcard.";
-    goto error;
-  }
-
-  if (rc) {
-    LOG(ERROR) << "Failed to mount sdcard: " << strerror(errno) << "\n";
-    goto error;
-  }
-  LOG(INFO) << "Done mounting sdcard\n";
-  return 0;
-
-error:
-  return -1;
-}
-
-InstallResult ApplyFromSdcard(Device* device) {
+InstallResult ApplyFromStorage(Device* device, VolumeInfo& vi) {
   auto ui = device->GetUI();
-  ui->Print("Update via sdcard. Mounting sdcard\n");
-
-  if (do_sdcard_mount() != 0) {
-    LOG(ERROR) << "\nFailed to mount sdcard\n";
+  if (!VolumeManager::Instance()->volumeMount(vi.mId)) {
     return INSTALL_NONE;
   }
 
-  std::string path = BrowseDirectory(SDCARD_ROOT, device, ui);
+  std::string path = BrowseDirectory(vi.mPath, device, ui);
   if (path.empty()) {
-    LOG(ERROR) << "\n-- No package file selected.\n";
-    ensure_path_unmounted(SDCARD_ROOT);
+    VolumeManager::Instance()->volumeUnmount(vi.mId);
     return INSTALL_NONE;
   }
 
@@ -317,6 +225,7 @@ InstallResult ApplyFromSdcard(Device* device) {
   SetSdcardUpdateBootloaderMessage();
 
   auto result = InstallWithFuseFromPath(path, device);
-  ensure_path_unmounted(SDCARD_ROOT);
+
+  VolumeManager::Instance()->volumeUnmount(vi.mId);
   return result;
 }
